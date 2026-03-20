@@ -1,0 +1,128 @@
+import cv2
+import numpy as np
+import torch
+from ultralytics import YOLO
+
+# YOLO detection model
+det_model = YOLO("/content/drive/MyDrive/best.onnx", task="detect")
+
+cap = cv2.VideoCapture("row3_fixed.mp4")
+
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = cap.get(cv2.CAP_PROP_FPS)
+
+out = cv2.VideoWriter(
+    "segmented_output3.mp4",
+    cv2.VideoWriter_fourcc(*"mp4v"),
+    fps,
+    (width, height)
+)
+
+frame_count = 0
+
+# ----------------------------
+# TRACKING STATE
+# ----------------------------
+prev_boxes = []
+next_id = 0
+IOU_THRESHOLD = 0.3
+CENTROID_THRESHOLD = 30  # pixels
+object_ids = {}  # maps box index → ID
+
+
+def compute_iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+
+    return interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+
+
+def centroid(box):
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+
+while cap.isOpened():
+
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame_count += 1
+    print("Processing frame:", frame_count)
+
+    # YOLO detection
+    results = det_model(frame)[0]
+    boxes = results.boxes.xyxy.cpu().numpy()
+
+    overlay = frame.copy()
+    alpha = 0.5
+
+    predictor.set_image(frame)
+
+    # ----------------------------
+    # ASSIGN TRACK IDs USING IOU
+    # ----------------------------
+    current_ids = {}
+    for i, box in enumerate(boxes):
+        best_iou = 0
+        best_id = None
+
+        for j, prev_box in enumerate(prev_boxes):
+            iou = compute_iou(box, prev_box)
+            cx1, cy1 = centroid(box)
+            cx2, cy2 = centroid(prev_box)
+            shift = np.hypot(cx1 - cx2, cy1 - cy2)
+
+            if iou > IOU_THRESHOLD and shift < CENTROID_THRESHOLD:
+                if iou > best_iou:
+                    best_iou = iou
+                    best_id = object_ids.get(j)
+
+        if best_id is None:
+            best_id = next_id
+            next_id += 1
+
+        current_ids[i] = best_id
+
+    # update tracking memory
+    object_ids = current_ids
+    prev_boxes = boxes.copy()
+
+    # ----------------------------
+    # SAM SEGMENTATION
+    # ----------------------------
+    if len(boxes) > 0:
+
+        masks, scores, logits = predictor.predict(
+            box=boxes,
+            multimask_output=False
+        )
+
+        for (mask, box), obj_id in zip(zip(masks, boxes), current_ids.values()):
+
+            mask = mask.squeeze() > 0
+            color = np.random.randint(0,255,(3,),dtype=int)
+
+            overlay[mask] = (
+                overlay[mask] * (1 - alpha) + color * alpha
+            ).astype(np.uint8)
+
+            x1,y1,x2,y2 = box.astype(int)
+            cv2.rectangle(overlay,(x1,y1),(x2,y2),(0,255,0),2)
+
+            # draw ID
+            cv2.putText(overlay, f"ID {obj_id}", (x1, y1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
+    out.write(overlay)
+
+cap.release()
+out.release()
